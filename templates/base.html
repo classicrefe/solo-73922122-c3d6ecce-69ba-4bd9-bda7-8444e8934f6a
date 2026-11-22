@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}铭牌编号入仓抽查{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<nav>
+  <strong>铭牌编号入仓抽查</strong>
+  <a href="{{ url_for('new_batch') }}">开批</a>
+  <a href="{{ url_for('list_batches') }}">批次查询</a>
+</nav>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <div class="flash {{ category }}">{{ message }}</div>
+  {% endfor %}
+{% endwith %}
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

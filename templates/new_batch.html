@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}开批 - 铭牌编号入仓抽查{% endblock %}
+{% block content %}
+<h1>开批(导入清单并抽样)</h1>
+<p class="hint">
+  规则: 为每批设定错录率上限(0~99 整数百分比)和 1~3 个递增的累计抽查数;
+  系统随机无放回抽出有序名单(抽样数 = 最大累计抽查数)。同批号重传将沿用原方案, 不重新抽样。
+</p>
+<form method="post" action="{{ url_for('create_batch_html') }}" enctype="multipart/form-data">
+  <label>批号
+    <input name="batch_no" required maxlength="64" value="{{ form.get('batch_no', '') }}"
+           placeholder="如 LOT-2026-001">
+  </label>
+  <label>错录率上限(%, 0~99 整数)
+    <input name="limit_pct" required type="number" min="0" max="99" step="1"
+           value="{{ form.get('limit_pct', '') }}">
+  </label>
+  <label>累计抽查数(1~3 个, 严格递增, 逗号分隔)
+    <input name="checkpoints" required value="{{ form.get('checkpoints', '') }}"
+           placeholder="如 20,35,50">
+  </label>
+  <label>抽样种子(可选, 留空则随机生成; 相同种子可复现同一抽样)
+    <input name="seed" value="{{ form.get('seed', '') }}">
+  </label>
+  <label>铭牌清单(每行一条: 条目号,铭牌编号)
+    <textarea name="items_text" rows="12"
+              placeholder="E001,NP-88001&#10;E002,NP-88002">{{ form.get('items_text', '') }}</textarea>
+  </label>
+  <label>或上传清单文件(UTF-8 文本, 格式同上; 选择文件后优先于文本框)
+    <input type="file" name="list_file" accept=".txt,.csv">
+  </label>
+  <div class="actions">
+    <button type="submit">开批并抽样</button>
+    <button type="button" id="demo-fill">填入演示数据</button>
+  </div>
+</form>
+<script>
+document.getElementById('demo-fill').addEventListener('click', function () {
+  const f = document.forms[0];
+  f.batch_no.value = 'LOT-2026-001';
+  f.limit_pct.value = '10';
+  f.checkpoints.value = '20,35,50';
+  f.seed.value = 'demo-seed-1';
+  let lines = [];
+  for (let i = 1; i <= 60; i++) {
+    const k = String(i).padStart(3, '0');
+    lines.push('E' + k + ',NP-88' + k);
+  }
+  f.items_text.value = lines.join('\n');
+});
+</script>
+{% endblock %}

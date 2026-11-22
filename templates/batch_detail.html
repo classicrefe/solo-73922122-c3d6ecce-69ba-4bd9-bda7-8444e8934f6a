@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}批次 {{ batch.batch_no }} - 铭牌编号入仓抽查{% endblock %}
+{% block content %}
+<h1>批次 {{ batch.batch_no }} <span class="status {{ batch.status }}">{{ batch.status_label }}</span></h1>
+
+<section class="panel">
+  <h2>抽样方案</h2>
+  <dl class="grid">
+    <dt>批量 N</dt><dd>{{ batch.size }}</dd>
+    <dt>错录率上限</dt><dd>{{ batch.limit_pct }}%</dd>
+    <dt>假设全批错录数(刚超限最小整数)</dt><dd>{{ batch.assumed_errors }}</dd>
+    <dt>检查点(累计抽查数)</dt><dd>{{ batch.checkpoints | join(', ') }}</dd>
+    <dt>通过阈值(5%/{{ batch.checkpoints | length }})</dt><dd>{{ '%.6g' | format(batch.threshold) }}</dd>
+    <dt>抽样种子</dt><dd>{{ batch.seed }}</dd>
+    <dt>开批时间(UTC)</dt><dd>{{ batch.created_at }}</dd>
+  </dl>
+</section>
+
+{% if batch.status != 'open' %}
+<section class="panel conclusion {{ batch.status }}">
+  <h2>封存结论: {{ batch.status_label }}</h2>
+  <dl class="grid">
+    <dt>判定检查点</dt><dd>第 {{ batch.conclusion_checkpoint }} 点</dd>
+    <dt>累计抽查数</dt><dd>{{ batch.conclusion_n }}</dd>
+    <dt>实测错录数</dt><dd>{{ batch.conclusion_errors }}</dd>
+    <dt>超几何概率 P</dt><dd>{{ '%.6g' | format(batch.conclusion_prob) }}</dd>
+    <dt>通过阈值</dt><dd>{{ '%.6g' | format(batch.conclusion_threshold) }}</dd>
+    <dt>封存时间(UTC)</dt><dd>{{ batch.concluded_at }}</dd>
+  </dl>
+  <p class="hint">批次已结批, 停止录入。</p>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>检查点进度与判定记录</h2>
+  <table>
+    <thead>
+      <tr><th>检查点</th><th>累计抽查数</th><th>已核/需核</th><th>累计错录</th>
+          <th>判定</th><th>P</th><th>阈值</th><th>时间(UTC)</th></tr>
+    </thead>
+    <tbody>
+      {% for p in progress %}
+      {% set j = judgments | selectattr('checkpoint_idx', 'equalto', p.idx) | first %}
+      <tr>
+        <td>第 {{ p.idx }} 点{% if not p.judged and batch.status == 'open' and p.idx == batch.next_checkpoint %}(待判定){% endif %}</td>
+        <td>{{ p.n }}</td>
+        <td>{{ p.checked }}/{{ p.n }}</td>
+        <td>{{ p.errors }}</td>
+        {% if j %}
+        <td>{{ '通过' if j.passed else '未通过' }}</td>
+        <td>{{ '%.6g' | format(j.prob) }}</td>
+        <td>{{ '%.6g' | format(j.threshold) }}</td>
+        <td>{{ j.judged_at }}</td>
+        {% else %}
+        <td colspan="4">未判定(第 1 条到本检查点未全部核完)</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if batch.status == 'open' %}
+<section class="panel">
+  <h2>录入核对结果</h2>
+  <form method="post" action="{{ url_for('entry_html', batch_no=batch.batch_no) }}" class="entry">
+    <label>条目号
+      <input name="entry_no" required placeholder="抽样名单中的条目号">
+    </label>
+    <label><input type="radio" name="result" value="ok" required> 正确</label>
+    <label><input type="radio" name="result" value="err"> 错误</label>
+    <button type="submit">录入</button>
+  </form>
+  <p class="hint">可乱序录入; 每条只记首个结果, 重复录入将被拒绝。</p>
+  {% if pending_entries %}
+  <div class="actions">
+    <span class="hint">演示辅助: 将当前检查点未核的 {{ pending_entries | length }} 条逐条提交为</span>
+    <button type="button" onclick="demoFill('ok')">全部「正确」</button>
+    <button type="button" onclick="demoFill('err')">全部「错误」</button>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>有序抽样名单(共 {{ sample | length }} 条; 未抽中条目无需核对)</h2>
+  <table>
+    <thead>
+      <tr><th>抽样序号</th><th>条目号</th><th>铭牌编号</th><th>核对结果</th><th>录入时间(UTC)</th></tr>
+    </thead>
+    <tbody>
+      {% for it in sample %}
+      <tr>
+        <td>{{ it.position }}</td>
+        <td>{{ it.entry_no }}</td>
+        <td>{{ it.nameplate_no }}</td>
+        <td>{{ it.result_label or '未核' }}</td>
+        <td>{{ it.result_at or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if batch.status == 'open' and pending_entries %}
+<script>
+const PENDING = {{ pending_entries | tojson }};
+const BATCH = {{ batch.batch_no | tojson }};
+async function demoFill(result) {
+  if (!confirm(`将把 ${PENDING.length} 条未核条目提交为「${result === 'ok' ? '正确' : '错误'}」, 继续?`)) return;
+  for (const entryNo of PENDING) {
+    const resp = await fetch(`/api/batches/${encodeURIComponent(BATCH)}/results`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({entry_no: entryNo, result: result})
+    });
+    if (!resp.ok) break;  // 如中途结批则停止
+  }
+  location.reload();
+}
+</script>
+{% endif %}
+{% endblock %}
