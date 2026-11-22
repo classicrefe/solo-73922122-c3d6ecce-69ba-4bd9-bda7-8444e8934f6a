@@ -84,20 +84,26 @@ def create_app(config=None):
     def create_batch_html():
         form = request.form
         file = request.files.get("list_file")
-        text = file.read().decode("utf-8") if file and file.filename else form.get("items_text", "")
+        if file and file.filename:
+            # 边读边解析并落临时表, 不把整份清单读进内存
+            pairs = core.iter_upload_items(file.stream)
+        else:
+            pairs = core.iter_text_items(form.get("items_text", ""))
         try:
             limit_pct = int(form.get("limit_pct", ""))
         except ValueError:
             limit_pct = -1
         try:
             checkpoints = core.parse_checkpoints(form.get("checkpoints", ""))
-            items = core.parse_items_text(text)
             batch, created, notice = core.create_batch(
-                dbmod.get_db(), form.get("batch_no"), limit_pct, checkpoints, items,
+                dbmod.get_db(), form.get("batch_no"), limit_pct, checkpoints, pairs,
                 seed=form.get("seed"))
         except core.DomainError as exc:
             flash(str(exc), "error")
-            return render_template("new_batch.html", form=form), 400
+            # 已产生的清单流不再需要; 显式关闭上传文件句柄
+            if file:
+                file.close()
+            return render_template("new_batch.html", form=form), exc.status
         flash(notice, "ok" if created else "warn")
         return redirect(url_for("batch_detail", batch_no=batch["batch_no"]))
 
@@ -134,7 +140,7 @@ def create_app(config=None):
         try:
             limit_pct = data.get("limit_pct")
             checkpoints = core.parse_checkpoints(data.get("checkpoints"))
-            items = core.normalize_items(data.get("items"))
+            items = core._api_pairs(data.get("items"))
             batch, created, notice = core.create_batch(
                 dbmod.get_db(), data.get("batch_no"), limit_pct, checkpoints, items,
                 seed=data.get("seed"))

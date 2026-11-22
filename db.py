@@ -59,9 +59,13 @@ def get_db() -> sqlite3.Connection:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # 上传清单的临时表与集合比较均落磁盘, 进程内存不随清单规模增长。
+        conn.execute("PRAGMA temp_store = FILE")
+        # 大清单开批的写锁可能持续数秒; 并发重传时等待而不是立即报错。
+        conn.execute("PRAGMA busy_timeout = 30000")
         g.db = conn
     return g.db
 

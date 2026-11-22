@@ -298,3 +298,311 @@ def test_html_form_flow(client):
     assert resp.status_code == 302
     kept = client.get("/api/batches/H1").get_json()["sample"][0]
     assert kept["result"] == "ok"
+
+
+# ---------------------------------------------------------------- 流式上传与原子性
+
+def _items_text(n):
+    return "\n".join(f"E{i:05d},NP-{i:05d}" for i in range(1, n + 1))
+
+
+def _post_file(client, text, batch_no="U1", seed="stream", checkpoints="20,40",
+               limit="10", encoding="utf-8"):
+    import io
+    return client.post("/batches", data={
+        "batch_no": batch_no, "limit_pct": limit, "checkpoints": checkpoints,
+        "seed": seed,
+        "list_file": (io.BytesIO(text.encode(encoding)), "list.txt")},
+        content_type="multipart/form-data")
+
+
+def test_streamed_upload_matches_textarea(client):
+    text = _items_text(300)
+    _post_file(client, text, batch_no="F1", seed="same")
+    client.post("/batches", data={
+        "batch_no": "F2", "limit_pct": "10", "checkpoints": "20,40",
+        "seed": "same", "items_text": text})
+    a = [it["entry_no"] for it in sample_of(client, "F1")["sample"]]
+    b = [it["entry_no"] for it in sample_of(client, "F2")["sample"]]
+    assert a == b
+    assert sample_of(client, "F1")["batch"]["size"] == 300
+
+
+def test_streamed_lines_crlf_and_no_final_newline(client):
+    text = "E1,NP-1\r\nE2,NP-2\r\nE3,NP-3"     # CRLF 且末尾无换行
+    resp = _post_file(client, text, batch_no="CR", checkpoints="2")
+    assert resp.status_code == 302
+    assert sample_of(client, "CR")["batch"]["size"] == 3
+
+
+def test_upload_bad_line_rejects_whole_batch(client):
+    text = _items_text(50) + "\n坏行只有一列\n"
+    resp = _post_file(client, text, batch_no="BAD1")
+    assert resp.status_code == 400
+    assert "格式" in resp.get_data(as_text=True)
+    assert client.get("/api/batches/BAD1").status_code == 404
+
+
+def test_upload_invalid_utf8_rejected(client):
+    import io
+    resp = client.post("/batches", data={
+        "batch_no": "UTF", "limit_pct": "10", "checkpoints": "5",
+        "list_file": (io.BytesIO(b"E1,NP-1\n\xff\xfe\n"), "bad.txt")},
+        content_type="multipart/form-data")
+    assert resp.status_code == 400
+    assert "UTF-8" in resp.get_data(as_text=True)
+    assert client.get("/api/batches/UTF").status_code == 404
+
+
+def test_duplicate_entries_no_partial_write(client):
+    text = "E1,NP-1\nE2,NP-2\nE1,NP-9\n"
+    resp = _post_file(client, text, batch_no="DUP")
+    assert resp.status_code == 400
+    body = client.get("/api/batches").get_json()["batches"]
+    assert all(b["batch_no"] != "DUP" for b in body)
+    # 失败后同批号仍可正常开批
+    assert _post_file(client, _items_text(50), batch_no="DUP").status_code == 302
+
+
+def test_reupload_reordered_is_same_set(client):
+    text = _items_text(40)
+    _post_file(client, text, batch_no="R1", seed="rr")
+    shuffled = "\n".join(reversed(text.splitlines()))
+    resp = client.post("/api/batches", json={
+        "batch_no": "R1", "limit_pct": 10, "checkpoints": [20, 40],
+        "items": [{"entry_no": l.split(",")[0], "nameplate_no": l.split(",")[1]}
+                  for l in shuffled.splitlines()], "seed": "other"})
+    assert resp.status_code == 200
+    notice = resp.get_json()["notice"]
+    assert "沿用原抽样方案" in notice
+    assert "不一致" not in notice            # 仅调换行序不算不同
+
+
+def test_reupload_changed_pair_detected(client):
+    _post_file(client, _items_text(40), batch_no="R2", seed="rr")
+    items = [{"entry_no": f"E{i:05d}", "nameplate_no": f"NP-{i:05d}"}
+             for i in range(1, 41)]
+    items[7]["nameplate_no"] = "NP-CHANGED"   # 同一行序, 只改铭牌编号配对
+    resp = client.post("/api/batches", json={
+        "batch_no": "R2", "limit_pct": 10, "checkpoints": [20, 40],
+        "items": items, "seed": "x"})
+    assert "不一致" in resp.get_json()["notice"]
+    # 原方案与原数据保持不变
+    assert sample_of(client, "R2")["batch"]["seed"] == "rr"
+    assert len(sample_of(client, "R2")["sample"]) == 40
+
+
+def test_storage_failure_leaves_no_batch(client, monkeypatch):
+    from core import StorageError
+
+    def boom(conn, batch_id):
+        raise StorageError("模拟写库失败")
+
+    # 让抽样的第一次 UPDATE 就失败, 验证批次与条目整体回滚
+    real_sample = __import__("random").Random.sample
+
+    def exploding_sample(self, population, k):
+        raise StorageError("模拟抽样阶段写库失败")
+
+    monkeypatch.setattr("random.Random.sample", exploding_sample)
+    resp = _post_file(client, _items_text(60), batch_no="FAIL1")
+    assert resp.status_code == 500
+    assert client.get("/api/batches/FAIL1").status_code == 404
+    listed = client.get("/api/batches").get_json()["batches"]
+    assert listed == []
+    monkeypatch.setattr("random.Random.sample", real_sample)
+    assert _post_file(client, _items_text(60), batch_no="FAIL1").status_code == 302
+
+
+def test_api_storage_failure_no_batch(client, monkeypatch):
+    def exploding(*_a, **_k):
+        raise __import__("sqlite3").OperationalError("disk I/O error")
+
+    monkeypatch.setattr("core._next_item_id", exploding)
+    resp = client.post("/api/batches", json={
+        "batch_no": "FAIL2", "limit_pct": 10, "checkpoints": [5],
+        "items": make_items(10), "seed": "x"})
+    assert resp.status_code == 500
+    assert "写库失败" in resp.get_json()["error"]
+    assert client.get("/api/batches/FAIL2").status_code == 404
+
+
+# ---------------------------------------------------------------- 大清单与内存
+
+def _stream_text(n, seed=0):
+    """不生成中间列表的大清单文本(逐行 yield)。"""
+    for i in range(1, n + 1):
+        yield f"E{i:07d},NP-{i:07d}\n"
+
+
+class _TextStream:
+    def __init__(self, lines):
+        self._lines = lines
+        self._buf = ""
+
+    def read(self, size=-1):
+        while len(self._buf) < (size if size > 0 else 64 * 1024):
+            try:
+                self._buf += next(self._lines)
+            except StopIteration:
+                break
+        out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+
+def test_large_upload_line_boundaries(client):
+    """大清单按块解码/切行, 不依赖一次性读入。"""
+    from core import iter_text_lines
+
+    def chunked(text, step):
+        for i in range(0, len(text), step):
+            yield text[i:i + step]
+
+    text = "".join(_stream_text(5000))
+    lines = list(iter_text_lines(chunked(text, 7)))
+    assert len(lines) == 5000
+    assert lines[0] == "E0000001,NP-0000001"
+    assert lines[-1] == "E0005000,NP-0005000"
+
+
+@pytest.mark.slow
+def test_large_list_memory_bounded(tmp_path):
+    """数十万条: 解析/校验/抽样/重传的额外内存不随行数线性增长。"""
+    import sqlite3
+    import tracemalloc
+
+    import db as dbmod
+    from core import create_batch, iter_upload_items
+
+    conn = sqlite3.connect(str(tmp_path / "big.db"))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA temp_store = FILE")
+    conn.executescript(dbmod.SCHEMA)
+    conn.commit()
+
+    n = 300_000
+
+    class LineStream:
+        """逐行产出, 模拟上传文件流; 自身只保留一行。"""
+
+        def __init__(self, order=None):
+            self.i = 0
+            self.order = order
+
+        def read(self, size):
+            if self.i >= n:
+                return b""
+            i = self.order[self.i] if self.order else self.i
+            self.i += 1
+            return f"E{i:07d},NP-{i:07d}\n".encode()
+
+    tracemalloc.start()
+    try:
+        batch, created, _ = create_batch(
+            conn, "BIG", 10, [100], iter_upload_items(LineStream()), seed="big")
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert created and batch["size"] == n
+    assert peak < 64 * 1024 * 1024, peak
+
+    # 重传同一份名单, 但行序完全打乱: 配对集合相同, 不新建、不提示不一致
+    import random as _random
+    order = list(range(n))
+    _random.Random(1).shuffle(order)
+    tracemalloc.start()
+    try:
+        _b2, created2, notice2 = create_batch(
+            conn, "BIG", 10, [100], iter_upload_items(LineStream(order)), seed="other")
+        _cur, peak2 = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert created2 is False
+    assert "不一致" not in notice2
+    assert peak2 < 64 * 1024 * 1024, peak2
+
+    # 只改一个铭牌编号的配对 -> 提示不一致
+    class ChangedStream(LineStream):
+        def read(self, size):
+            row = super().read(size)
+            if row.startswith(b"E0000010,"):
+                return b"E0000010,NP-CHANGED\n"
+            return row
+
+    _b3, created3, notice3 = create_batch(
+        conn, "BIG", 10, [100], iter_upload_items(ChangedStream()), seed="x")
+    assert created3 is False and "不一致" in notice3
+
+
+def test_sample_matches_reference_draw():
+    """相同种子下抽样结果必须与改造前(random.sample 于条目 id 序列)完全一致。"""
+    import random
+    import sqlite3
+    import db as dbmod
+    from core import create_batch
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA temp_store = FILE")
+    conn.executescript(dbmod.SCHEMA)
+    conn.commit()
+
+    upload_order = list(range(1, 121))
+    random.Random(7).shuffle(upload_order)
+    pairs = [(f"E{i:03d}", f"NP-{i:03d}") for i in upload_order]
+    batch, created, _ = create_batch(conn, "REF", 10, [30, 60], pairs, seed="ref-seed")
+    assert created
+
+    # 参照: 旧实现按上传顺序逐条 INSERT 得到连续 id, 再 rng.sample(ids, 60)
+    first_id = conn.execute(
+        "SELECT MIN(id) FROM items WHERE batch_id = ?", (batch["id"],)).fetchone()[0]
+    expected = random.Random("ref-seed").sample(range(first_id, first_id + 120), 60)
+    got = [r["id"] for r in conn.execute(
+        "SELECT id FROM items WHERE batch_id = ? AND position IS NOT NULL "
+        "ORDER BY position", (batch["id"],))]
+    assert got == expected
+    by_id = {r["id"]: r["entry_no"] for r in conn.execute(
+        "SELECT id, entry_no FROM items WHERE batch_id = ?", (batch["id"],))}
+    # 条目 id = first_id + 上传序号, 因此可比对抽中 id 对应到哪一条
+    assert [by_id[i] for i in got] == [
+        f"E{upload_order[i - first_id]:03d}" for i in got]
+    # 条目 id 连续, 且与上传顺序一致
+    rows = conn.execute(
+        "SELECT id, entry_no FROM items WHERE batch_id = ? ORDER BY id", (batch["id"],)).fetchall()
+    assert [r["id"] for r in rows] == list(range(first_id, first_id + 120))
+    assert [r["entry_no"] for r in rows] == [f"E{i:03d}" for i in upload_order]
+
+
+def test_reupload_still_validates_whole_file(client):
+    """同批号重传也要逐行校验整份文件: 坏行/重复条目号一样整批拒绝, 原批次不受影响。"""
+    _post_file(client, _items_text(40), batch_no="RV", seed="rv")
+    before = sample_of(client, "RV")
+
+    bad = "\n".join(_items_text(40).splitlines() + ["坏行"])
+    resp = _post_file(client, bad, batch_no="RV")
+    assert resp.status_code == 400
+    assert "格式" in resp.get_data(as_text=True)
+
+    dup = _items_text(40) + "\nE00001,NP-X"
+    resp = _post_file(client, dup, batch_no="RV")
+    assert resp.status_code == 400
+    assert "重复" in resp.get_data(as_text=True)
+
+    after = sample_of(client, "RV")
+    assert [it["entry_no"] for it in before["sample"]] == \
+           [it["entry_no"] for it in after["sample"]]
+    assert after["batch"]["size"] == 40
+    assert after["batch"]["seed"] == "rv"
+
+
+def test_reupload_same_file_same_plan(client):
+    """同一份文件重传: 沿用原方案, 不提示不一致, 抽样完全不变。"""
+    text = _items_text(200)
+    _post_file(client, text, batch_no="RS", seed="rs", checkpoints="50,100")
+    first = [(it["position"], it["entry_no"]) for it in sample_of(client, "RS")["sample"]]
+    resp = _post_file(client, text, batch_no="RS", seed="different", checkpoints="10")
+    assert resp.status_code == 302
+    detail = sample_of(client, "RS")
+    assert detail["batch"]["seed"] == "rs"
+    assert detail["batch"]["checkpoints"] == [50, 100]
+    assert [(it["position"], it["entry_no"]) for it in detail["sample"]] == first

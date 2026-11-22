@@ -10,4 +10,4 @@ ENV DB_PATH=/data/nameplate.db
 EXPOSE 8000
 VOLUME ["/data"]
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "wsgi:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "300", "wsgi:app"]

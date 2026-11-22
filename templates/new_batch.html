@@ -29,6 +29,8 @@
   <label>或上传清单文件(UTF-8 文本, 格式同上; 选择文件后优先于文本框)
     <input type="file" name="list_file" accept=".txt,.csv">
   </label>
+  <p class="hint">大清单请用上传文件: 服务端流式解析, 内存占用与总行数无关。
+    同批号重传请再次上传原清单(或调整后的清单), 系统沿用原抽样方案。</p>
   <div class="actions">
     <button type="submit">开批并抽样</button>
     <button type="button" id="demo-fill">填入演示数据</button>
